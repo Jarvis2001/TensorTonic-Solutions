@@ -1,109 +1,118 @@
 #include <cuda_runtime.h>
 
-#define TILE_M 32
-#define TILE_N 32
-#define TILE_K 16
+#define BM 64
+#define BN 64
+#define BK 16
+#define TM 4
+#define TN 4
 
 __global__ void matmul_kernel(
     const float* __restrict__ A,
     const float* __restrict__ B,
     float* __restrict__ C,
-    int M,
-    int N,
-    int K
-) {
-    __shared__ float As[TILE_M][TILE_K];
-    __shared__ float Bs[TILE_K][TILE_N];
+    int M, int N, int K)
+{
+    __shared__ float As[BM][BK];
+    __shared__ float Bs[BK][BN];
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
 
-    // Each thread computes 2x2 outputs
-    const int row0 = blockIdx.y * TILE_M + 2 * ty;
-    const int row1 = row0 + 1;
+    const int row_base = blockIdx.y * BM + ty * TM;
+    const int col_base = blockIdx.x * BN + tx * TN;
 
-    const int col0 = blockIdx.x * TILE_N + 2 * tx;
-    const int col1 = col0 + 1;
+    float acc[TM][TN] = {0.0f};
 
-    float c00 = 0.0f;
-    float c01 = 0.0f;
-    float c10 = 0.0f;
-    float c11 = 0.0f;
+    for (int kb = 0; kb < K; kb += BK) {
 
-    const int num_tiles = (K + TILE_K - 1) / TILE_K;
+        // -------------------------------------------------
+        // Load A tile: 64 x 16 = 1024 floats
+        // 256 threads -> 4 values/thread
+        // -------------------------------------------------
+        int tid = ty * blockDim.x + tx;
 
-    for (int tile = 0; tile < num_tiles; ++tile) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int linear = tid + i * (blockDim.x * blockDim.y);
 
-        const int k_base = tile * TILE_K;
+            int ar = linear / BK;
+            int ak = linear % BK;
 
-        // ------------------------------------------------------------
-        // Load A: 32x16 tile
-        // 256 threads load 512 elements => 2 per thread
-        // ------------------------------------------------------------
-        int a_k = k_base + tx;
+            int gr = blockIdx.y * BM + ar;
+            int gk = kb + ak;
 
-        if (row0 < M && a_k < K)
-            As[2 * ty][tx] = A[row0 * K + a_k];
-        else
-            As[2 * ty][tx] = 0.0f;
+            As[ar][ak] =
+                (gr < M && gk < K)
+                ? A[gr * K + gk]
+                : 0.0f;
+        }
 
-        if (row1 < M && a_k < K)
-            As[2 * ty + 1][tx] = A[row1 * K + a_k];
-        else
-            As[2 * ty + 1][tx] = 0.0f;
+        // -------------------------------------------------
+        // Load B tile: 16 x 64 = 1024 floats
+        // -------------------------------------------------
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int linear = tid + i * (blockDim.x * blockDim.y);
 
-        // ------------------------------------------------------------
-        // Load B: 16x32 tile
-        // 256 threads load 512 elements => 2 per thread
-        // ------------------------------------------------------------
-        int b_row = k_base + ty;
+            int bk = linear / BN;
+            int bc = linear % BN;
 
-        if (b_row < K && col0 < N)
-            Bs[ty][2 * tx] = B[b_row * N + col0];
-        else
-            Bs[ty][2 * tx] = 0.0f;
+            int gk = kb + bk;
+            int gc = blockIdx.x * BN + bc;
 
-        if (b_row < K && col1 < N)
-            Bs[ty][2 * tx + 1] = B[b_row * N + col1];
-        else
-            Bs[ty][2 * tx + 1] = 0.0f;
+            Bs[bk][bc] =
+                (gk < K && gc < N)
+                ? B[gk * N + gc]
+                : 0.0f;
+        }
 
         __syncthreads();
 
-        // ------------------------------------------------------------
-        // Compute 2x2 output tile
-        // ------------------------------------------------------------
+        // -------------------------------------------------
+        // Compute 64x64 tile
+        // -------------------------------------------------
         #pragma unroll
-        for (int k = 0; k < TILE_K; ++k) {
-            float a0 = As[2 * ty][k];
-            float a1 = As[2 * ty + 1][k];
+        for (int k = 0; k < BK; ++k) {
 
-            float b0 = Bs[k][2 * tx];
-            float b1 = Bs[k][2 * tx + 1];
+            float a[TM];
 
-            c00 += a0 * b0;
-            c01 += a0 * b1;
-            c10 += a1 * b0;
-            c11 += a1 * b1;
+            #pragma unroll
+            for (int i = 0; i < TM; ++i)
+                a[i] = As[ty * TM + i][k];
+
+            float b[TN];
+
+            #pragma unroll
+            for (int j = 0; j < TN; ++j)
+                b[j] = Bs[k][tx * TN + j];
+
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] += a[i] * b[j];
+                }
+            }
         }
 
         __syncthreads();
     }
 
-    // ------------------------------------------------------------
+    // -------------------------------------------------
     // Store
-    // ------------------------------------------------------------
-    if (row0 < M && col0 < N)
-        C[row0 * N + col0] = c00;
+    // -------------------------------------------------
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        #pragma unroll
+        for (int j = 0; j < TN; ++j) {
 
-    if (row0 < M && col1 < N)
-        C[row0 * N + col1] = c01;
+            int r = row_base + i;
+            int c = col_base + j;
 
-    if (row1 < M && col0 < N)
-        C[row1 * N + col0] = c10;
-
-    if (row1 < M && col1 < N)
-        C[row1 * N + col1] = c11;
+            if (r < M && c < N)
+                C[r * N + c] = acc[i][j];
+        }
+    }
 }
 
 extern "C" void solve(const float* A, const float* B, float* C, int M, int N, int K) {
